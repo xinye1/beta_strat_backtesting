@@ -1,0 +1,6 @@
+.Rhistory
+.Rproj.user
+*.Rproj
+*.pdf
+*.html
+data/

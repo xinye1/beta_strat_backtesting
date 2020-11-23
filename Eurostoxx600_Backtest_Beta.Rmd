@@ -1,0 +1,794 @@
+---
+title: "Eurostoxx600 Backtesting on Beta"
+author: "Xinye Li"
+date: "22/11/2020"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r options, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Intro {.tabset .tabset-fade}
+
+### The Task
+
+The tasks is evaluating a strategy based on Beta.
+
+The strategy is on the first work day in Jan 2015, calculate the **6-month** Beta of all stocks, and select **30 stocks** with the lowest Beta values, then allocate €1,000,000 **evenly** to the 30 stocks, and sell these stocks at the end of the **3rd month**. Using the available capital to invest in another 30 stocks selected in the same way (with lowest Beta for the 6-months prior). Repeat this on a quarterly basis until the end of 2019.
+
+Do the same one more time except use the highest Beta values each time.
+
+As highlighted in **bold**, these parameters can be explored to understand returns. This will be discussed in the last section "Generalisation".
+
+### The Approach
+
+Generally data cleaning and sense checking are required, e.g. removing duplicates, correcting price shifting (e.g. stock dilution), missing values etc., but for simplicity I have assumes there are no devastating errors in the data and therefore skipped this step. Although missing values will be dealt with appropriately in certain steps.
+
+Best practices include (all observed in the code):
+
+* using single purpose functions as much as appropriate
+* exposing adjustable parameters (e.g. above bold ones)
+* using vectorised, and if possible, parallel processing for heavy and long calculations
+
+The high level steps are:
+
+1. Calculate the Beta of all stocks at all the starting points in one go
+2. Select the stocks at each start
+3. Calculate the daily return of the whole portfolio for each quarter
+4. Scale each quarter by the return of the last quarter
+5. Get the Sortino Ratio
+
+## Setup {.tabset .tabset-fade}
+
+### Basics
+
+Import data and some simple clean up.
+
+```{r setup}
+# Load libraries
+library(timeDate)                 # for getting Bank Holidays
+library(tidyverse)                # for majority of the data manipulations
+library(lubridate)                # date manipulations
+library(purrr)                    # efficient iteration, part of Functional Programming
+library(furrr)                    # the multi-core parallel version of purrr
+library(plotly)                   # interactive data visualisation
+library(DT)                       # flexible data table
+library(PerformanceAnalytics)     # quant package, used here for getting Sortino Ratio
+library(kableExtra)               # makes kable prettier
+
+# Import the data
+raw_prices <- readRDS('data/Prices.rds')
+
+prices <- raw_prices %>%
+  as.data.frame() %>%             # Convert to data frame
+  rownames_to_column('date') %>%  # Make date available as column
+  mutate(date = as.Date(date))    # Convert date to "Date" format for date arithmetic
+```
+
+### Parameters
+
+Set the value of some parameters. This hints at how much is parameterised, which makes the process very powerful for adjusting the strategy.
+
+```{r params}
+initial_capital <- 1000000
+start_year <- 2015 # start and end years of activity
+end_year <- 2019
+index_col <- 'Eurostoxx600' # the column name of the index
+holding_months <- 3 # the number of months for holding the portfolio
+portf_size <- 30 # the number of stocks to select each time
+beta_history <- 6 # the number of months for calculating Beta
+portf_types <- c('low', 'high') # the top (high) or bottom (low) Beta band
+weights <- c('equal') # the stock weights for allocating the capital
+                      # other options can be by Beta or by Sharpe Ratio
+tickers <- colnames(raw_prices)[-1] # the available ticker names, for ease of access
+```
+
+### Functions {.tabset .tabset-pills}
+
+There are some trivial but crucial functions to set up. The comments before each function (e.g. `@param x a vector`) is the official format for documenting R functions, it provides description of the function and its input parameters, and the return value / object. These lines can be directly used for documenting the functions in an R package, which then provides function documentation such as [this](https://stat.ethz.ch/R-manual/R-devel/library/base/html/sum.html).
+
+> `@description` describes what the function does  
+> `@param` list the input variables, with the variable name after "param"  
+> `@return` describes the object returned by the function, if any  
+
+#### getReturn
+
+Calculates daily return of a price vector
+
+```{r getReturn}
+#' @description Calculates daily return of a price vector
+#' @param x a vector
+#' @return a vector of length length(x) - 1
+getReturn <- function(x) {
+  (x - lag(x)) / lag(x)
+}
+```
+
+#### calcBeta
+
+Calculates Beta given the price of a stock and the index
+
+```{r calcBeta}
+#' @description Calculates Beta given the price of a stock and the index
+#' @param input_df has an index column idx,
+#'   and another column for the ticker, 
+#'   the order of columns does not matter
+#' @param idx the name of the index
+#' @return a single numeric value
+calcBeta <- function(input_df, idx = 'Eurostoxx600') {
+  # get the ticker name from the input
+  ticker <- names(input_df)[which(names(input_df) != idx)] 
+  
+  # create a data frame to use for linear modelling
+  ols <- data.frame( 
+    idx_ret = getReturn(input_df[[idx]]),
+    x_ret = getReturn(input_df[[ticker]]),
+    stringsAsFactors = F) %>%
+    lm(x_ret ~ idx_ret, .) # use linear regress for OLS estimate
+  
+  ols[['coefficients']][['idx_ret']] # get the coefficient
+}
+```
+
+#### getCycleCal
+
+Generates a calendar based on the investment cycle
+
+```{r getCycleCal}
+#' @description Generates a calendar based on the investment cycle
+#' @param date_df a data frame with a single column named \code{date}
+#' @param start_year,end_year integer for the start and end year of the output calendar
+#' @param holding_months the number of months per cycle
+#' @return a calendar data frame with \code{date}, \code{year} and \code{cycle}
+getCycleCal <- function(date_df, start_year, end_year, holding_months) {
+  cycle_df <- expand_grid( # create a data frame of all combinations of year and cycle
+    year = start_year:end_year,
+    cycle = 1:(12 / holding_months)) %>%
+    mutate( # based on number of holding_months get the start and end month of each cycle
+      start_month = (cycle - 1) * holding_months + 1,
+      end_month = start_month + holding_months - 1
+    )
+  
+  date_df %>% # then join the above back to the full dates
+    mutate(
+      year = lubridate::year(date),
+      month = lubridate::month(date)) %>%
+    left_join(cycle_df, by = 'year') %>%
+    filter(
+      start_month <= month & # make sure month is between start and end months
+        month <= end_month) %>%
+    select(
+      date, year, cycle)
+}
+```
+
+#### getCycleDates
+
+Finds the start and end dates of a given cycle,
+
+```{r getCycleDates}
+#' @description Finds the start and end dates of a given cycle,
+#' @param cycle_cal a data frame returned by \code{\link{getCycleCal}}
+#' @param target_year,target_cycle the target year and cycle
+#' @return a numeric vector of two elements, the start and end date of the cycle
+getCycleDates <- function(cycle_cal, target_year, target_cycle) {
+  tmp <- cycle_cal %>% # simply filter the input calendar by the correct year and cycle
+    dplyr::filter(year == target_year) %>%
+    dplyr::filter(cycle == target_cycle)
+  
+  range(tmp[['date']]) # get the min and max of the date
+}
+```
+
+## Stock Selection {.tabset .tabset-fade}
+
+The steps are:
+
+1. Find the dates of the Beta period
+2. Get the data frame of the selected stock
+3. Check the price data is sufficient for the period
+4. If the last data point has an `NA` then don't calculate Beta (indicates price won't be available next period)
+5. Calculate Beta using `lm` function to estimate the OLS estimate
+6. Get both the top and bottom (30) stocks by Beta
+7. Return all the parameters involved
+
+Step is done by `getTickerDF`, step 5 is done by `getBeta`, and `selectStocks` wraps around these to finish everything else.
+
+### Functions {.tabset .tabset-pills}
+
+#### getTickerDF
+
+Gets a data frame given a ticker
+
+```{r getTickerDF}
+#' @description Get a data frame give a ticker
+#' @param input_df a data frame, has a column with name "Eurostoxx600",
+#'   and has a column with name ticker
+#' @param ticker a string vector for the ticker(s)
+#' @return a data frame with the date, index, and the ticker(s) column(s)
+getTickerDF <- function(input_df, ticker) {
+  input_df %>%
+    # select date, index and the selected ticker
+    select_at(vars('date', 'Eurostoxx600', all_of(ticker))) %>% 
+    na.omit() # remove any rows with missing values
+}
+```
+
+#### getBeta
+
+Validates a ticker data frame and calculate the Beta of possible
+
+```{r getBeta}
+#' @description Validates a ticker data frame and calculate the Beta of possible
+#' @param input_df a data frame with an index column and a stock column
+#' @param start_date,end_date date format, the first and last day of the Beta period,
+#'   at least one needs to be specified. If both are specified then \code{history} is
+#'   ignored, otherwise one is derived by the other + \code{history}
+#' @param history an integer, the period for Beta, this is overwritten
+#'   if \code{start_date} is specified
+#' @param min_history an integer, the minimal period required to calculate Beta,
+#'   default is 1 unit less than \code{history}
+#' @param skip_na_days logical, if \code{TRUE} then the missing days are not counted
+#'   as part of the history, i.e. the history will be extended backward if
+#'   there are missing days
+#' @return A numerical value if there sufficient input data (given data range etc.),
+#'   otherwise \code{NA_real_}
+getBeta <- function(input_df, start_date, end_date,
+                    history = 6L, min_history = history - 1,
+                    history_unit = 'month', skip_na_days = F) {
+  if (missing(start_date) & missing(end_date)) { # needs at least one of the dates
+    stop('Both start_date and end_date are missing.')}
+  
+  if (missing(start_date)) { # if start_date is missing then derive it using end and duration
+    start_date <- (end_date - lubridate::duration(history, history_unit)) %>%
+      as.Date() + days(1)
+  } else if (missing(end_date)) { # if end_date is missing derive it using start and duration
+    end_date <- (start_date + lubridate::duration(history, history_unit)) %>%
+      as.Date() - days(1)
+  }
+  
+  tmp <- input_df %>% # get the correct dates
+    filter(between(date, start_date, end_date))
+  
+  if (skip_na_days) { # if choose to remove NA then filter them out
+    tmp <- tmp %>% na.omit()
+  }
+  
+  if (nrow(tmp) > 0) { # proceed only if there is data
+    if (interval(
+      min(tmp[['date']]), max(tmp[['date']])) %>%
+      as.numeric(unit = 'month') >= min_history) { # proceed if the number of days available
+      calcBeta(tmp %>% select(-date))              # is greater than a minimal level specified
+    } else {
+      return(NA_real_) # otherwise return NA
+    }
+  } else {
+    return(NA_real_) # otherwise return NA
+  }
+}
+```
+
+#### selectStocks
+
+Selects stocks with built-in Beta calculation
+
+```{r selectStocks}
+#' @description Select stocks with built-in Beta calculation
+#' @param input_df a data frame with date and price columns
+#' @param base_idx the name of the index column based on which Beta is calculated
+#' @param cycle_cal a data frame returned by \code{getCycleCal}
+#' @param target_year,target_cycle the target year and cycle for which the stocks are selected
+#' @param holding_months integer, the number of months per cycle (holding period of the stocks),
+#'   default 3 months
+#' @param portf_size integer, the number of stocks per band (high and low), default 30
+#' @param beta_history integer, the number of months on which Beta is based, default 6
+#' @return a data frame with stock tickers, the input parameters and the Beta for each stock
+selectStocks <- function(input_df, base_idx,
+                         cycle_cal, target_year, target_cycle,
+                         holding_months = 3, portf_size = 30,
+                         beta_history = 6, progress = F) {
+  target_dates <- cycle_cal %>% # get the start and end dates of the selected cycle
+    getCycleDates(target_year, target_cycle)
+  target_end_date <- target_dates[1] - days(1) # get the end date of the previous cycle
+                                               # this is used to select the previous 6 months
+
+  tickers <- names(input_df)[ # get the ticker names from the input
+    which(!names(input_df) %in% c('date', base_idx))]
+  
+  if (progress) { # show a progress bar if specified, for visual cues
+    pb_ticker <- progress_bar$new(
+      format = '(:spin) [:bar] :percent eta: :eta',
+      total = length(tickers), clear = T, width= 100)
+  }
+  
+  betas <- tickers %>% # get all the Beta for the tickers
+    map_dbl(function(x) { # use a variation of map function to return a numerical vector
+      if (progress) pb_ticker$tick() # show a progress bar if specified, for visual cue
+      input_df %>%
+        getTickerDF(x) %>% # get the ticker data frame
+        getBeta( # and calculate the Beta
+          end_date = target_end_date,
+          history = beta_history,
+          history_unit = 'month')
+    })
+  beta_tbl <- tibble( # collect the results and the parameters in one place
+    ticker = tickers,
+    year = target_year,
+    cycle = target_cycle,
+    holding_months = holding_months,
+    portf_size = portf_size,
+    beta_history = beta_history,
+    beta = betas
+  )
+  
+  # these two lines select select stocks based on the highest and lowest Betas
+  beta_low <- beta_tbl %>% top_n(portf_size, -beta) %>% mutate(beta_type = 'low')
+  beta_high <- beta_tbl %>% top_n(portf_size, beta) %>% mutate(beta_type = 'high')
+  
+  bind_rows(beta_low, beta_high)
+}
+```
+
+
+### Stock Selection
+
+```{r select_stocks_main, eval=FALSE}
+cycle_cal <- prices %>% # create a cycle calendar
+  select(date) %>%
+  getCycleCal(start_year, end_year, holding_months)
+
+stocks <- expand_grid( # select the stocks for each year / quarter combination
+  target_year = start_year:end_year,
+  target_cycle = 1:(12 / holding_months)) %>%
+  pmap(function(target_year, target_cycle) {
+    selectStocks(
+      prices, index_col, cycle_cal,
+      target_year, target_cycle,
+      holding_months, portf_size,
+      beta_history, F)
+  }) %>% bind_rows() # bind all elements of the list together by row
+```
+
+
+
+## Evaluation {.tabset .tabset-fade}
+
+### Approach
+
+The steps are:
+
+1. Based on the cycle time frame and Beta type (high/low) get the selected stocks
+2. Get the daily price for the stocks
+3. Forward fill missing prices if any, and remove stocks without a price on the first day
+3. Normalise the price by the price on the first day of the cycle
+4. For each day get the weighted (equal weights for now) normalised prices of the portfolio
+5. Get the return per quarter by extracting the last return value of the quarter
+6. Multiply the quarterly returns cumulatively to get the compounded quarterly return
+7. Multiply the normalised prices of each quarter over the whole strategy period by the compounded quarterly return, this gives the daily normalised value of the strategy, the actual value is this multiplied by the initial capital (€1,000,000)
+
+Steps 2 - 4 are done by `getPortfRet` function, and `getStratRet` wraps around it to finish everything else.
+
+### Functions {.tabset .tabset-pills}
+
+#### getPortfRet
+
+Calculates the daily returns of a portfolio
+
+```{r getPortfRet}
+#' @description Calculates the daily returns of a portfolio
+#' @param price_df a data frame with date and price columns
+#' @param tickers a character vector for selected stocks
+#' @param start_date,end_date Date format, start and end date of the portfolio holding
+#' @param portf_weights a numeric vector of the same length as \code{tickers},
+#'   the weights for capital allocation
+#' @return a tibble with date and return columns
+getPortfRet <- function(price_df, tickers, start_date, end_date, portf_weights) {
+  
+  portf_df <- price_df %>% # get the correct date range
+    filter(between(date, start_date, end_date))
+  
+  portf_idx <- portf_df %>% # select the ticker columns
+    select_at(vars(all_of(tickers))) %>%
+    mutate_all(~ ./.[1]) # scale each column by its first element, therefore the normalised prices
+  
+  # fill NAs with the last non-NA value
+  na_cols <- names(portf_idx)[portf_idx %>% map_lgl(~ any(is.na(.)))]
+  if (length(na_cols) > 0) {
+    portf_idx <- portf_idx %>%
+      fill(sym(na_cols), .direction = 'down')
+  }
+  
+  # remove columns with NA
+  full_na_cols <- portf_idx %>% map_lgl(~ any(is.na(.)))
+  na_cols1 <- names(portf_idx)[full_na_cols]
+  if (length(na_cols) > 0) {
+    for (each_col in na_cols1) {
+      portf_idx[[each_col]] <- NULL
+    }
+    tmp_weights <- portf_weights[!full_na_cols] # remove the corresponding weights
+    portf_weights <- tmp_weights / sum(tmp_weights) # rebalance the remaining weights
+  }
+  
+  portf_ret <- as.matrix(portf_idx) %*% portf_weights # apply matrix multiplication
+                                                      # or the weighted sum of all stocks
+  
+  tibble(
+    date = portf_df[['date']],
+    return = c(portf_ret) / c(portf_ret)[1] # return the normalised prices
+  )
+}
+```
+
+#### getStratRet
+
+Calculates the daily and holding cycle returns of a Beta strategy
+
+```{r getStratRet}
+#' @description Calculates the daily and holding cycle returns of a Beta strategy
+#' @param price_df a data frame with date and price columns
+#' @param beta_df a data frame with Beta and parameter columns,
+#'   tickers are derived from this
+#' @param start_year,end_year integers, start and end years of the strategy
+#' @param h_mths integer, number of months for each holding cycle
+#' @param b_hist integer, number of months of history for calculating Beta
+#' @param p_size integer, portfolio size for each holding cycle
+#' @param p_type character, portfolio type, one of \code{high} and
+#'   \code{low} for the Beta type
+#' @param p_wts portfolio weights, capital allocation weigths for each stock
+#' @return a list that includes the parameters, daily return of the whole strategy,
+#'   independent return of each cycle and cumulative return of each cycle
+getStratRet <- function(prices_df, beta_df,
+                        start_year, end_year,
+                        h_mths, b_hist, p_size, p_type, p_wts) {
+  if (p_wts == 'equal') { # here different weight options can be applied
+    weights <- rep(1, p_size) / p_size # only equal weights are implimented
+  } else {
+    weights <- rep(1, p_size) / p_size
+  }
+  
+  cycle_cal <-  prices_df %>% # create a cycle calendar
+    select(date) %>%
+    getCycleCal(start_year, end_year, h_mths)
+  
+  cycle_grid <- expand_grid( # create all combinations of year and cycle
+    t_year = start_year:end_year,
+    t_cycle = 1:(12 / h_mths))
+  
+  tmp_return <- cycle_grid %>% # for each year / cycle combo get the returns
+    pmap(function(t_year, t_cycle) {
+      cycle_dates <- cycle_cal %>% # get start / end dates of each cycle
+        getCycleDates(t_year, t_cycle)
+      
+      tickers <- beta_df %>% # find all the tickers selected from before
+        filter(
+          year == t_year &
+            cycle == t_cycle &
+            holding_months == h_mths &
+            portf_size == p_size &
+            beta_history == b_hist &
+            beta_type == p_type) %>%
+        pull(ticker)
+      
+      prices_df %>% # get the return of the selected tickers
+        getPortfRet(
+          tickers,
+          cycle_dates[1], cycle_dates[2],
+          weights)
+      
+    })
+  
+  cycle_returns <- tmp_return %>% # extract the cycle returns
+    map_dbl(~ tail(.[['return']], 1)) # this is the last element of each cycle
+  cumul_returns <- cumprod(cycle_returns) # get the cumulative product as the cumulative return
+  daily_returns <- list( # get the daily return by multiplying the cumulative return and price
+    df = tmp_return,
+    ret = cumul_returns
+  ) %>%
+    pmap(function(df, ret) {
+      df %>% mutate(return = return * ret) # applying cumulative return from previous cycles
+    }) %>%
+    bind_rows()
+  
+  list(
+    holding_months = h_mths,
+    beta_history = b_hist,
+    portf_size = p_size,
+    portf_type = p_type,
+    portf_weights = p_wts,
+    portf_daily_return = daily_returns,
+    portf_cycle_return = cycle_grid %>% # combine the year / cycle table with the returns
+      bind_cols(
+        tibble(
+          cycle_return = cycle_returns,
+          cumul_return = cumul_returns
+        )
+      )
+  )
+}
+```
+
+
+### Strategy Returns
+
+```{r strat_returns, eval=FALSE}
+strat_return <- portf_types %>% # get the strategy returns for low and high Beta
+  map(function(x) {
+    getStratRet(
+      prices, stocks, start_year, end_year,
+      holding_months, beta_history,
+      portf_size, x, weights)
+  })
+```
+
+```{r, echo=FALSE}
+strat_return <- readRDS('data/strat_return.RDS')
+```
+
+### Visualisation {.tabset .tabset-pills}
+
+#### Quarterly Returns
+
+```{r vis_ret_cycle}
+cycle_returns <- strat_return %>% # extract cycle returns from the above
+  map(function(x) {
+    x[['portf_cycle_return']] %>%
+      mutate(
+        holding_months = x[['holding_months']],
+        beta_history = x[['beta_history']],
+        portf_size = x[['portf_size']],
+        portf_type = x[['portf_type']]
+      )
+  }) %>% bind_rows()
+
+cycle_returns %>% # create a bar chart for quarterly returns
+  mutate(
+    year_cycle = paste0(t_year, '-', t_cycle), # create a single year / quarter column
+    # apply the initial investment to price
+    investment_value = cumul_return * initial_capital) %>%
+  plot_ly(
+    x = ~ year_cycle, y = ~ cumul_return, # x is year/cycle, y is the cumulative return
+    color = ~ portf_type, type = 'bar') %>%
+  layout(
+    legend = list(orientation = 'h', x = 0.4, y = -0.2),
+    title = "Quarterly Cumulative Returns",
+    xaxis = list(title = 'Quarter', automargin = 'true'),
+    yaxis = list(title = 'Return €'))
+```
+
+#### Daily Returns
+
+
+```{r vis_ret_daily}
+daily_returns <- strat_return %>% # same as the quarterly returns, except using daily
+  map(function(x) {
+    x[['portf_daily_return']] %>%
+      mutate(
+        holding_months = x[['holding_months']],
+        beta_history = x[['beta_history']],
+        portf_size = x[['portf_size']],
+        portf_type = x[['portf_type']]
+      )
+  }) %>% bind_rows()
+
+daily_returns %>%
+  mutate(investment_value = return * initial_capital) %>%
+  plot_ly(
+    x = ~ date, y = ~ return,
+    color = ~ portf_type,
+    type = 'scatter', mode = 'lines') %>%
+  layout(
+    legend = list(orientation = 'h', x = 0.4, y = -0.1),
+    title = "Daily Cumulative Returns",
+    xaxis = list(title = '', automargin = 'true'),
+    yaxis = list(title = 'Return €'))
+```
+
+
+### Sortino Ratio {.tabset .tabset-fade}
+
+For simplicity here we will use the existing [`SortinoRatio` function](https://rdrr.io/cran/PerformanceAnalytics/man/SortinoRatio.html) from the `PerformanceAnalytics` package.
+
+We use the daily returns of the strategies.
+
+```{r sortino_func}
+s_ratios <- portf_types %>% # calculate for low and high strategies
+  map_dbl(function(x) { # return numeric vectors
+    daily_returns %>%
+      dplyr::filter(portf_type == x) %>%
+      pull(return) %>% # extract the single column
+      getReturn() %>% # convert the normalised prices to returns
+      SortinoRatio()
+  })
+
+data.frame(
+  type = str_to_title(portf_types),
+  s_ratios = round(s_ratios, 3)
+) %>%
+  kable(
+    col.names = c('Type', 'Sortino Ratio'),
+    format = 'html') %>%
+  kable_styling(full_width = F)
+```
+
+This means that **the low strategy has a higher risk-adjusted return**, primarily because of the lower volatility.
+
+## Best Strategy {.tabset .tabset-fade}
+
+Going back to the beginning with the parameters:
+
+* Holding months of a portfolio (`holding_months`)
+* The portfolio size (`portf_size`)
+* The length of history for calculating the Beta (`beta_history`)
+
+It is useful to understand how changing the value of them can impact the overall return of the strategy. This is made possible by exposing the parameters in functions, and with extensive use of the `map` function from [`purrr` package](https://purrr.tidyverse.org/) and the `expand_grid` to create combinations of the parameter values, we can get the overall returns of all scenarios.
+
+For longer calculations apply parallel processing using `future_map` (instead of `map`) from the [`furrr` package](https://github.com/DavisVaughan/furrr).
+
+### Expand Parameters
+
+Instead of a single number these parameters are now sequences
+
+```{r param_expand}
+holding_months <- c(2:4, 6) # generates 2, 3, 4, 6
+portf_size <- seq.int(10, 50, 10) # generates 10, 20, 30, 40, 50
+beta_history <- seq.int(3, 12, 3) # generates 3, 6, 9, 12
+```
+
+And the grid can be created like so
+
+```{r param_DT}
+# create all combinations of the above parameters
+param_grid <- expand_grid(
+  holding_months = holding_months,
+  portf_size = portf_size,
+  beta_history = beta_history)
+
+datatable( # display the parameter table
+  param_grid, rownames = F,
+  options = list( dom = 'ltp'))
+```
+
+
+### Stock Selection
+
+Below is an example of generating the Beta for all stocks and all parameter value combinations.
+
+This takes just over 40 minutes to process on my machine.
+
+```{r param_select, eval=FALSE}
+# these two lines is for parallel processing
+n_cores <- availableCores() # get the available cores of the machine
+plan(multiprocess, workers = n_cores, gc = T) # use all the cores
+
+beta_all <- param_grid %>%
+  # future_map is a parallel version of map
+  future_pmap(function(holding_months, portf_size, beta_history) { 
+    cycle_cal <- prices %>%
+      select(date) %>%
+      getCycleCal(start_year, end_year, holding_months)
+    
+    expand_grid(
+      target_year = start_year:end_year,
+      target_cycle = 1:(12 / holding_months)) %>%
+      pmap(function(target_year, target_cycle) {
+        selectStocks(
+          prices, index_col, cycle_cal, target_year, target_cycle,
+          holding_months, portf_size,
+          beta_history)
+      }) %>% bind_rows()
+  }) %>% bind_rows()
+```
+
+
+### Evaluation
+
+And the code for calculating the returns.
+
+This take less than 1 minute to process.
+
+```{r paral_eval, eval=FALSE}
+return_batch_grid <- expand_grid( # get all combinations of parameters
+  h_mths = holding_months,
+  b_hist = beta_history,
+  p_size = portf_size,
+  p_type = portf_types,
+  p_wts = 'equal'
+)
+
+# set up parallel process
+n_cores <- availableCores()
+plan(multiprocess, workers = n_cores, gc = T)
+
+return_all <- return_batch_grid %>%
+  future_pmap(function(h_mths, b_hist, p_size, p_type, p_wts) { # parallel
+    getStratRet(
+      prices, beta_all, start_year, end_year,
+      h_mths, b_hist, p_size, p_type, p_wts)
+  })
+future:::ClusterRegistry("stop") # stop the multi-core plan to release RAM
+```
+
+### Insight {.tabset .tabset-pills}
+
+Here are some high level insight
+
+1. **Low Beta** is almost always better
+2. Portfolio **holding period** is better at **either ends** (2 months or 6 months)
+3. **Longer Beta history** is better, i.e. greater or equal to 6 months
+4. **Medium to small sized portfolios** (<= 40 stocks) generally have higher Sortino Ratio
+
+#### Extract Sortino Ratio
+
+We will look at the Sortino Ratio for all the strategies.
+
+```{r parallel_sortino, eval=FALSE}
+daily_returns_all <- return_all %>% # same as the quarterly returns, except using daily
+  map(function(x) {
+    x[['portf_daily_return']] %>%
+      mutate(
+        holding_months = x[['holding_months']],
+        beta_history = x[['beta_history']],
+        portf_size = x[['portf_size']],
+        portf_type = x[['portf_type']]
+      )
+  }) %>% bind_rows()
+
+s_ratios_all <- return_batch_grid %>% # calculate for low and high strategies
+  pmap_dbl(function(h_mths, b_hist, p_size, p_type, p_wts) {
+    daily_returns_all %>%
+      filter(
+        holding_months == h_mths &
+          beta_history == b_hist &
+          portf_size == p_size &
+          portf_type == p_type) %>%
+      pull(return) %>%
+      getReturn() %>% # convert the normalised prices to returns
+      SortinoRatio() %>%
+      pluck(1, 1) # extract the number
+  })
+
+s_ratios_df <- return_batch_grid %>%
+  mutate(sortino_ratio = s_ratios_all) # combine Sortino back to the param grid
+```
+
+```{r parallel_import, echo=FALSE}
+s_ratios_df <- readRDS('data/s_ratios_df.RDS')
+```
+
+#### Visualisation
+
+This is a panel of 4 different bubble charts, each corresponding to a Beta history length (3, 6, 9, 12 months respectively). X axis is the length of holding each portfolio, Y axis is the Sortino Ratio. The colours correspond to different combinations of Beta history length and the type (high / low).
+
+From this chart it's clear that a portfolio of **40 stocks** selected based on **9-month low Beta**, held for **6 months** (rather than 3) for each cycle generates the best Sortino Ratio of 0.113 (the highest brown bubble in the bottom left panel).
+
+```{r parallel_vis}
+beta_history %>%
+  map(function(x) {
+    s_ratios_df %>%
+      filter(b_hist == x) %>% # arrange subplot by Beta month
+      plot_ly(
+        x = ~ h_mths, y = ~ sortino_ratio,
+        size = ~ p_size * 2, type = 'scatter',
+        mode = 'markers', colors = 'Dark2',
+        # show the Beta month and type (high/low) in the legend
+        name = ~ paste0('Beta: ', b_hist, '-month | ', str_to_title(p_type))) %>%
+      layout(
+        legend = list(orientation = 'h',  y = -0.2),
+        title = "Strategy Sortino Ratio Comparison",
+        xaxis = list(title = 'Holding Months', automargin = 'true'),
+        yaxis = list(title = 'Sortino Ratio'))
+  }) %>%
+  subplot(
+    nrows = 2,
+    shareX = T, shareY = T)
+```
+
