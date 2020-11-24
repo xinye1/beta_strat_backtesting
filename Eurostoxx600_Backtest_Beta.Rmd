@@ -555,7 +555,7 @@ cycle_returns %>% # create a bar chart for quarterly returns
     # apply the initial investment to price
     investment_value = cumul_return * initial_capital) %>%
   plot_ly(
-    x = ~ year_cycle, y = ~ cumul_return, # x is year/cycle, y is the cumulative return
+    x = ~ year_cycle, y = ~ investment_value, # x is year/cycle, y is the cumulative return
     color = ~ portf_type, type = 'bar') %>%
   layout(
     legend = list(orientation = 'h', x = 0.4, y = -0.2),
@@ -582,7 +582,7 @@ daily_returns <- strat_return %>% # same as the quarterly returns, except using 
 daily_returns %>%
   mutate(investment_value = return * initial_capital) %>%
   plot_ly(
-    x = ~ date, y = ~ return,
+    x = ~ date, y = ~ investment_value,
     color = ~ portf_type,
     type = 'scatter', mode = 'lines') %>%
   layout(

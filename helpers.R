@@ -1,3 +1,12 @@
+# ### Functions {.tabset .tabset-pills}
+# 
+# There are some trivial but crucial functions to set up. The comments before each function (e.g. `@param x a vector`) is the official format for documenting R functions, it provides description of the function and its input parameters, and the return value / object. These lines can be directly used for documenting the functions in an R package, which then provides function documentation such as [this](https://stat.ethz.ch/R-manual/R-devel/library/base/html/sum.html).
+# 
+# > `@description` describes what the function does  
+# > `@param` list the input variables, with the variable name after "param"  
+# > `@return` describes the object returned by the function, if any  
+
+
 #' @description Calculates daily return of a price vector
 #' @param x a vector
 #' @return a vector of length length(x) - 1
