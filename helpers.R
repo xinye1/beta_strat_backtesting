@@ -27,7 +27,9 @@ calcBeta <- function(input_df, idx = 'Eurostoxx600') {
     idx_ret = getReturn(input_df[[idx]]),
     x_ret = getReturn(input_df[[ticker]]),
     stringsAsFactors = F) %>%
-    lm(x_ret ~ idx_ret, .)
+    MASS::rlm(
+      formula = x_ret ~ idx_ret,
+      data = .)
   
   ols[['coefficients']][['idx_ret']]
 }

@@ -98,3 +98,10 @@ data.frame(
     col.names = c('Type', 'Sortino Ratio'),
     format = 'html') %>%
   kable_styling(full_width = F)
+
+
+daily_returns %>%
+  mutate(investment_value = return * initial_capital) %>%
+  ggplot(aes(date, return, colour = portf_type)) +
+  geom_line()
+

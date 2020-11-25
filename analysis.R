@@ -1,4 +1,4 @@
-pacman::p_load(timeDate, tidyverse, lubridate, purrr, progress, ggplot2, furrr, plotly, knitr, kableExtra)
+pacman::p_load(timeDate, MASS, tidyverse, lubridate, purrr, progress, ggplot2, furrr, plotly, knitr, kableExtra, PerformanceAnalytics)
 source('helpers.R')
 raw_prices <- readRDS('data/Prices.rds')
 prices <- raw_prices %>%
@@ -8,11 +8,17 @@ prices <- raw_prices %>%
 
 
 # params ----
-start_year <- 2015
+initial_capital <- 1000000
+start_year <- 2015 # start and end years of activity
 end_year <- 2019
-holding_months <- 3
-portf_size <- 30
-beta_history <- 6
+index_col <- 'Eurostoxx600' # the column name of the index
+holding_months <- 3 # the number of months for holding the portfolio
+portf_size <- 30 # the number of stocks to select each time
+beta_history <- 6 # the number of months for calculating Beta
+portf_types <- c('low', 'high') # the top (high) or bottom (low) Beta band
+weights <- c('equal') # the stock weights for allocating the capital
+# other options can be by Beta or by Sharpe Ratio
+tickers <- colnames(raw_prices)[-1] # the available ticker names, for ease of access
 min_history <- 6
 skip_na_days <- FALSE
 

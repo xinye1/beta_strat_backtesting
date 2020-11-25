@@ -4,6 +4,10 @@ author: "Xinye Li"
 date: "22/11/2020"
 output:
   html_document:
+    theme: united
+    highlight: pygments
+    number_sections: true
+    code_folding: show
     self_contained: true
     toc: true
     toc_float:
@@ -17,9 +21,9 @@ editor_options:
 knitr::opts_chunk$set(eval = TRUE, echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-## Intro {.tabset .tabset-fade}
+# Intro {.tabset .tabset-fade}
 
-### The Task
+## Task
 
 The tasks is evaluating a strategy based on Beta.
 
@@ -29,15 +33,15 @@ Do the same one more time except use the highest Beta values each time.
 
 As highlighted in **bold**, these parameters can be explored to understand returns. This will be discussed in the last section "Generalisation".
 
-### The Approach
+## Approach
 
 Generally data cleaning and sense checking are required, e.g. removing duplicates, correcting price shifting (e.g. stock dilution), missing values etc., but for simplicity I have assumes there are no devastating errors in the data and therefore skipped this step. Although missing values will be dealt with appropriately in certain steps.
 
 Best practices include (all observed in the code):
 
-* using single purpose functions as much as appropriate
-* exposing adjustable parameters (e.g. above bold ones)
-* using vectorised, and if possible, parallel processing for heavy and long calculations
+* Using single purpose functions as much as appropriate
+* Exposing adjustable parameters (e.g. above bold ones)
+* Using vectorised, and if possible, parallel processing for heavy and long calculations
 
 The high level steps are:
 
@@ -45,17 +49,18 @@ The high level steps are:
 2. Select the stocks at each start
 3. Calculate the daily return of the whole portfolio for each quarter
 4. Scale each quarter by the return of the last quarter
-5. Get the Sortino Ratio
+5. Get the Sortino Ratio from the daily strategy values
 
-## Setup {.tabset .tabset-fade}
+# Setup {.tabset .tabset-fade}
 
-### Basics
+## Basics
 
 Import data and some simple clean up.
 
 ```{r setup}
 # Load libraries
 library(timeDate)                 # for getting Bank Holidays
+library(MASS)                     # for Robust Linear Model function rlm
 library(tidyverse)                # for majority of the data manipulations
 library(lubridate)                # date manipulations
 library(purrr)                    # efficient iteration, part of Functional Programming
@@ -74,7 +79,7 @@ prices <- raw_prices %>%
   mutate(date = as.Date(date))    # Convert date to "Date" format for date arithmetic
 ```
 
-### Parameters
+## Parameters
 
 Set the value of some parameters. This hints at how much is parameterised, which makes the process very powerful for adjusting the strategy.
 
@@ -92,7 +97,7 @@ weights <- c('equal') # the stock weights for allocating the capital
 tickers <- colnames(raw_prices)[-1] # the available ticker names, for ease of access
 ```
 
-### Functions {.tabset .tabset-pills}
+## Helper Functions {.tabset .tabset-pills}
 
 There are some trivial but crucial functions to set up. The comments before each function (e.g. `@param x a vector`) is the official format for documenting R functions, it provides description of the function and its input parameters, and the return value / object. These lines can be directly used for documenting the functions in an R package, which then provides function documentation such as [this](https://stat.ethz.ch/R-manual/R-devel/library/base/html/sum.html).
 
@@ -100,7 +105,7 @@ There are some trivial but crucial functions to set up. The comments before each
 > `@param` list the input variables, with the variable name after "param"  
 > `@return` describes the object returned by the function, if any  
 
-#### getReturn
+### getReturn
 
 Calculates daily return of a price vector
 
@@ -113,7 +118,7 @@ getReturn <- function(x) {
 }
 ```
 
-#### calcBeta
+### calcBeta
 
 Calculates Beta given the price of a stock and the index
 
@@ -133,13 +138,13 @@ calcBeta <- function(input_df, idx = 'Eurostoxx600') {
     idx_ret = getReturn(input_df[[idx]]),
     x_ret = getReturn(input_df[[ticker]]),
     stringsAsFactors = F) %>%
-    lm(x_ret ~ idx_ret, .) # use linear regress for OLS estimate
+    rlm(x_ret ~ idx_ret, .) # use robust linear regress with Huber weights
   
   ols[['coefficients']][['idx_ret']] # get the coefficient
 }
 ```
 
-#### getCycleCal
+### getCycleCal
 
 Generates a calendar based on the investment cycle
 
@@ -171,7 +176,7 @@ getCycleCal <- function(date_df, start_year, end_year, holding_months) {
 }
 ```
 
-#### getCycleDates
+### getCycleDates
 
 Finds the start and end dates of a given cycle,
 
@@ -189,7 +194,7 @@ getCycleDates <- function(cycle_cal, target_year, target_cycle) {
 }
 ```
 
-## Stock Selection {.tabset .tabset-fade}
+# Stock Selection {.tabset .tabset-fade}
 
 The steps are:
 
@@ -197,15 +202,15 @@ The steps are:
 2. Get the data frame of the selected stock
 3. Check the price data is sufficient for the period
 4. If the last data point has an `NA` then don't calculate Beta (indicates price won't be available next period)
-5. Calculate Beta using `lm` function to estimate the OLS estimate
+5. Calculate Beta using `rlm` (robust linear model) with Huber weights
 6. Get both the top and bottom (30) stocks by Beta
 7. Return all the parameters involved
 
-Step is done by `getTickerDF`, step 5 is done by `getBeta`, and `selectStocks` wraps around these to finish everything else.
+Step 2 is done by `getTickerDF`, step 5 is done by `getBeta`, and `selectStocks` wraps around these to finish everything else.
 
-### Functions {.tabset .tabset-pills}
+## Helper Functions {.tabset .tabset-pills}
 
-#### getTickerDF
+### getTickerDF
 
 Gets a data frame given a ticker
 
@@ -223,7 +228,7 @@ getTickerDF <- function(input_df, ticker) {
 }
 ```
 
-#### getBeta
+### getBeta
 
 Validates a ticker data frame and calculate the Beta of possible
 
@@ -277,7 +282,7 @@ getBeta <- function(input_df, start_date, end_date,
 }
 ```
 
-#### selectStocks
+### selectStocks
 
 Selects stocks with built-in Beta calculation
 
@@ -339,7 +344,7 @@ selectStocks <- function(input_df, base_idx,
 ```
 
 
-### Stock Selection
+## Stock Selection
 
 ```{r select_stocks_main, eval=FALSE}
 cycle_cal <- prices %>% # create a cycle calendar
@@ -360,9 +365,9 @@ stocks <- expand_grid( # select the stocks for each year / quarter combination
 
 
 
-## Evaluation {.tabset .tabset-fade}
+# Evaluation {.tabset .tabset-fade}
 
-### Approach
+## Approach
 
 The steps are:
 
@@ -377,9 +382,9 @@ The steps are:
 
 Steps 2 - 4 are done by `getPortfRet` function, and `getStratRet` wraps around it to finish everything else.
 
-### Functions {.tabset .tabset-pills}
+## Helper Functions {.tabset .tabset-pills}
 
-#### getPortfRet
+### getPortfRet
 
 Calculates the daily returns of a portfolio
 
@@ -428,7 +433,7 @@ getPortfRet <- function(price_df, tickers, start_date, end_date, portf_weights) 
 }
 ```
 
-#### getStratRet
+### getStratRet
 
 Calculates the daily and holding cycle returns of a Beta strategy
 
@@ -517,7 +522,7 @@ getStratRet <- function(prices_df, beta_df,
 ```
 
 
-### Strategy Returns
+## Strategy Returns
 
 ```{r strat_returns, eval=FALSE}
 strat_return <- portf_types %>% # get the strategy returns for low and high Beta
@@ -533,9 +538,9 @@ strat_return <- portf_types %>% # get the strategy returns for low and high Beta
 strat_return <- readRDS('data/strat_return.RDS')
 ```
 
-### Visualisation {.tabset .tabset-pills}
+## Visualisation {.tabset .tabset-pills}
 
-#### Quarterly Returns
+### Quarterly Returns
 
 ```{r vis_ret_cycle}
 cycle_returns <- strat_return %>% # extract cycle returns from the above
@@ -564,7 +569,7 @@ cycle_returns %>% # create a bar chart for quarterly returns
     yaxis = list(title = 'Return €'))
 ```
 
-#### Daily Returns
+### Daily Returns
 
 
 ```{r vis_ret_daily}
@@ -593,7 +598,7 @@ daily_returns %>%
 ```
 
 
-### Sortino Ratio {.tabset .tabset-fade}
+## Sortino Ratio {.tabset .tabset-fade}
 
 For simplicity here we will use the existing [`SortinoRatio` function](https://rdrr.io/cran/PerformanceAnalytics/man/SortinoRatio.html) from the `PerformanceAnalytics` package.
 
@@ -621,7 +626,7 @@ data.frame(
 
 This means that **the low strategy has a higher risk-adjusted return**, primarily because of the lower volatility.
 
-## Best Strategy {.tabset .tabset-fade}
+# Bonus - Best Strategy {.tabset .tabset-fade}
 
 Going back to the beginning with the parameters:
 
@@ -633,7 +638,7 @@ It is useful to understand how changing the value of them can impact the overall
 
 For longer calculations apply parallel processing using `future_map` (instead of `map`) from the [`furrr` package](https://github.com/DavisVaughan/furrr).
 
-### Expand Parameters
+## Expand Parameters
 
 Instead of a single number these parameters are now sequences
 
@@ -652,13 +657,20 @@ param_grid <- expand_grid(
   portf_size = portf_size,
   beta_history = beta_history)
 
-datatable( # display the parameter table
-  param_grid, rownames = F,
-  options = list( dom = 'ltp'))
+param_grid %>%
+  kable(
+    caption = paste0('Parameter Combinations: ', nrow(param_grid)),
+    row.names = T,
+    format = 'html') %>%
+  kable_styling(
+    full_width = F,
+    position = "center",
+    bootstrap_options = c('hover', 'condensed')) %>%
+    scroll_box(height = "300px")
 ```
 
 
-### Stock Selection
+## Stock Selection
 
 Below is an example of generating the Beta for all stocks and all parameter value combinations.
 
@@ -689,7 +701,7 @@ beta_all <- param_grid %>%
 ```
 
 
-### Evaluation
+## Evaluation
 
 And the code for calculating the returns.
 
@@ -717,16 +729,16 @@ return_all <- return_batch_grid %>%
 future:::ClusterRegistry("stop") # stop the multi-core plan to release RAM
 ```
 
-### Insight {.tabset .tabset-pills}
+## Insight {.tabset .tabset-pills}
 
 Here are some high level insight
 
 1. **Low Beta** is almost always better
-2. Portfolio **holding period** is better at **either ends** (2 months or 6 months)
+2. It's better to **hold portfolios for longer** (~ 6 months+)
 3. **Longer Beta history** is better, i.e. greater or equal to 6 months
-4. **Medium to small sized portfolios** (<= 40 stocks) generally have higher Sortino Ratio
+4. **Medium sized portfolios** (~ 40 stocks) are generally better
 
-#### Extract Sortino Ratio
+### Extract Sortino Ratio
 
 We will look at the Sortino Ratio for all the strategies.
 
@@ -762,13 +774,15 @@ s_ratios_df <- return_batch_grid %>%
 
 ```{r parallel_import, echo=FALSE}
 s_ratios_df <- readRDS('data/s_ratios_df.RDS')
+top_strat <- s_ratios_df %>%
+  top_n(1, sortino_ratio)
 ```
 
-#### Visualisation
+### Visualisation
 
 This is a panel of 4 different bubble charts, each corresponding to a Beta history length (3, 6, 9, 12 months respectively). X axis is the length of holding each portfolio, Y axis is the Sortino Ratio. The colours correspond to different combinations of Beta history length and the type (high / low).
 
-From this chart it's clear that a portfolio of **40 stocks** selected based on **9-month low Beta**, held for **6 months** (rather than 3) for each cycle generates the best Sortino Ratio of 0.113 (the highest brown bubble in the bottom left panel).
+From this chart it's clear that a portfolio of **`r pull(top_strat, p_size)` stocks** selected based on **`r pull(top_strat, b_hist)`-month `r pull(top_strat, p_type)` Beta**, held for **`r pull(top_strat, h_mths)` months** for each cycle generates the best Sortino Ratio of **`r round(pull(top_strat, sortino_ratio), 3)`** (the bubble corresponding to the highest y-axis).
 
 ```{r parallel_vis}
 beta_history %>%
@@ -784,11 +798,14 @@ beta_history %>%
       layout(
         legend = list(orientation = 'h',  y = -0.2),
         title = "Strategy Sortino Ratio Comparison",
-        xaxis = list(title = 'Holding Months', automargin = 'true'),
+        xaxis = list(
+          title = 'Holding Months',
+          type = 'category',
+          automargin = 'true'),
         yaxis = list(title = 'Sortino Ratio'))
   }) %>%
   subplot(
-    nrows = 2,
+    nrows = 1,
     shareX = T, shareY = T)
 ```
 
